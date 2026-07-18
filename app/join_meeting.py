@@ -204,6 +204,46 @@ def join_meet(link: str, guest_name: str, max_seconds: int) -> None:
                 pass
 
 
+def _first_visible_input(page, selector: str, timeout_ms: int = 10_000):
+    """Ritorna il primo input visibile che matcha `selector`. Utile quando
+    il DOM contiene input nascosti (form login) accanto a quelli attivi."""
+    end = time.time() + timeout_ms / 1000.0
+    while time.time() < end:
+        loc = page.locator(selector)
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            try:
+                if el.is_visible():
+                    return el
+            except Exception:
+                pass
+        time.sleep(0.3)
+    raise TimeoutError(f"nessun elemento visibile per {selector} entro {timeout_ms}ms")
+
+
+def _click_first_visible_button(page, texts, timeout_ms: int = 10_000) -> bool:
+    """Cerca fra i button un testo tra quelli forniti, cliccando il PRIMO
+    visibile. Torna True se ha cliccato, False in caso di timeout.
+
+    Wildix Collaboration 7 tiene nel DOM anche i bottoni di flow paralleli
+    (login email, password, ecc.) come primi hit del selettore: se usiamo
+    `.first`, prendiamo quelli nascosti e falliamo su actionability."""
+    end = time.time() + timeout_ms / 1000.0
+    while time.time() < end:
+        for txt in texts:
+            loc = page.locator(f"button:has-text('{txt}')")
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                try:
+                    if el.is_visible():
+                        el.click()
+                        return True
+                except Exception:
+                    continue
+        time.sleep(0.3)
+    return False
+
+
 def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
     """Wildix Collaboration 7 / x-bees guest join via Playwright.
 
@@ -241,74 +281,59 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
         # con `domcontentloaded` i bottoni non sono ancora stati montati.
         page.goto(link, wait_until="load", timeout=45_000)
 
-        # 1) Bottone "Entra come ospite" / "Continua come ospite". Wildix
-        # Collaboration 7 lo mostra dopo i 3 bottoni "Accedi con Google/
-        # Microsoft/email". Aspettiamo con un selettore case-insensitive
-        # composito prima di iterare i pattern, cosi' evitiamo di partire
-        # mentre React sta ancora renderizzando.
-        guest_selector = (
-            "button:has-text('Continua come ospite'), "
-            "button:has-text('Entra come ospite'), "
-            "button:has-text('Continue as guest'), "
-            "button:has-text('Join as guest'), "
-            "button:has-text('Ospite'), "
-            "button:has-text('Guest')"
+        # 1) Bottone "Continua come ospite" / "Entra come ospite" / varianti.
+        # Wildix Collaboration 7 lo mostra dopo i 3 bottoni "Accedi con
+        # Google/Microsoft/email". Usiamo l'helper che aspetta il primo
+        # visibile, cosi' evitiamo di partire mentre React sta ancora
+        # montando e di prendere per errore un bottone nascosto.
+        guest_ok = _click_first_visible_button(
+            page,
+            [
+                "Continua come ospite", "Entra come ospite",
+                "Continue as guest", "Join as guest",
+                "Ospite", "Guest",
+            ],
+            timeout_ms=20_000,
         )
-        guest_ok = False
-        try:
-            page.wait_for_selector(guest_selector, state="visible", timeout=20_000)
-            page.locator(guest_selector).first.click()
+        if guest_ok:
             log.info("click guest OK")
-            guest_ok = True
-        except Exception as exc:
-            log.warning("bottone 'ospite' non trovato in 20s: %s", exc)
+        else:
+            log.warning("bottone 'ospite' non trovato in 20s")
 
         # 2) Dopo il click 'ospite' Wildix mostra un form con un input
         # testuale (senza placeholder specifico) e un bottone submit
-        # 'Prossimo'. Aspettiamo l'input, riempiamo col nome guest.
+        # 'Prossimo'. Aspettiamo l'input VISIBILE (il DOM Wildix contiene
+        # anche input nascosti del flow di login classico) e lo riempiamo.
         try:
-            page.wait_for_selector("input[type='text']", state="visible", timeout=15_000)
-            page.locator("input[type='text']").first.fill(guest_name)
+            _first_visible_input(page, "input[type='text']", timeout_ms=15_000).fill(guest_name)
             log.info("nome guest inserito: %s", guest_name)
         except Exception as exc:
             log.warning("input nome non trovato: %s", exc)
 
-        # 3) Click 'Prossimo' (type=submit). Il form conferma il nome guest
-        # e ci porta al passo successivo (audio/video o direct join).
-        next_selector = (
-            "button[type='submit']:has-text('Prossimo'), "
-            "button[type='submit']:has-text('Next'), "
-            "button:has-text('Prossimo'), "
-            "button:has-text('Next')"
-        )
-        try:
-            page.wait_for_selector(next_selector, state="visible", timeout=10_000)
-            page.locator(next_selector).first.click()
-            log.info("click 'Prossimo' OK")
-        except Exception as exc:
-            log.warning("bottone 'Prossimo' non trovato: %s", exc)
+        # 3) Click 'Prossimo'. Il selettore matcha 3 elementi (il primo del
+        # DOM e' un bottone nascosto del flow email/password che non uso).
+        # Serve il primo VISIBILE, non il primo del DOM.
+        if not _click_first_visible_button(
+            page, ["Prossimo", "Next"], timeout_ms=10_000,
+        ):
+            log.warning("bottone 'Prossimo' non trovato visibile in 10s")
 
-        # 4) Dopo 'Prossimo' Wildix puo' presentare uno step con prompt
-        # audio/video (a volte no, direct join). Diamo qualche secondo,
-        # poi tentiamo il bottone finale se compare. Se non compare
-        # assumiamo di essere gia' in call.
+        # 4) Dopo 'Prossimo' Wildix presenta uno step ulteriore (prompt
+        # audio/video o un altro bottone) prima di entrare in call. Diamo
+        # qualche secondo per il rendering.
         time.sleep(4)
 
-        join_button_patterns = (
+        join_button_patterns = [
             "Collegati alla riunione", "Collegati",
             "Entra ora", "Entra",
             "Partecipa alla riunione", "Partecipa",
             "Join meeting", "Join now", "Join",
-        )
-        for pat in join_button_patterns:
-            try:
-                btn = page.locator(f"button:has-text('{pat}')").first
-                if btn.is_visible(timeout=2_000):
-                    log.info("click join finale: %s", pat)
-                    btn.click()
-                    break
-            except Exception:
-                continue
+            "Prossimo", "Next",  # a volte c'e' un altro Prossimo prima del join
+        ]
+        if _click_first_visible_button(page, join_button_patterns, timeout_ms=8_000):
+            log.info("click join finale OK")
+        else:
+            log.info("nessun bottone join finale visibile — assumo gia' in call")
 
         # In call: aspettiamo max_seconds o chiusura tab (kick host)
         log.info("in call — resto per max %ds", max_seconds)
