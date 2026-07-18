@@ -204,11 +204,127 @@ def join_meet(link: str, guest_name: str, max_seconds: int) -> None:
                 pass
 
 
+def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
+    """Wildix Collaboration 7 / x-bees guest join via Playwright.
+
+    Flusso confermato dal cliente (2026-07-18):
+      1. Landing di `app.wildix.com/inbox/<uuid>?ref=calendar&join` (o
+         `*.x-bees.com/...`) mostra opzioni login + un bottone "Entra
+         come ospite" (o equivalente in inglese).
+      2. Dopo aver cliccato "ospite" appare un input per il nome guest.
+      3. Bottone finale "Collegati alla riunione" / "Join meeting" fa
+         entrare in call.
+
+    Non serve login: Wildix identifica la stanza dall'UUID nella URL.
+    """
+    from playwright.sync_api import sync_playwright  # noqa: WPS433
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=[
+                "--use-fake-ui-for-media-stream",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        ctx = browser.new_context(
+            permissions=[],
+            locale="it-IT",
+            timezone_id="Europe/Rome",
+        )
+        page = ctx.new_page()
+        log.info("navigazione a %s", link)
+        page.goto(link, wait_until="domcontentloaded", timeout=45_000)
+
+        # 1) Bottone "Entra come ospite" / "Join as guest" / "Continua
+        # come ospite". Wildix ne ha varianti sia in italiano che inglese.
+        guest_button_patterns = (
+            "Entra come ospite", "Continua come ospite",
+            "Join as guest", "Continue as guest",
+            "Ospite", "Guest",
+        )
+        guest_ok = False
+        for pat in guest_button_patterns:
+            try:
+                btn = page.locator(f"button:has-text('{pat}'), a:has-text('{pat}')").first
+                if btn.is_visible(timeout=6_000):
+                    log.info("click guest: %s", pat)
+                    btn.click()
+                    guest_ok = True
+                    break
+            except Exception:
+                continue
+        if not guest_ok:
+            log.warning("bottone 'ospite' non trovato in 6s (proseguo comunque: alcune UI Wildix mostrano direttamente il campo nome)")
+
+        # 2) Campo nome guest. Selettori generici perche' Wildix ha piu'
+        # varianti (input libero, o field con placeholder specifico).
+        name_selectors = (
+            "input[placeholder*='nome' i]",
+            "input[placeholder*='name' i]",
+            "input[aria-label*='nome' i]",
+            "input[aria-label*='name' i]",
+            "input[type='text']:not([name='email']):not([name='password'])",
+        )
+        name_ok = False
+        for sel in name_selectors:
+            try:
+                name_input = page.locator(sel).first
+                name_input.wait_for(state="visible", timeout=8_000)
+                name_input.fill(guest_name)
+                name_ok = True
+                log.info("nome guest inserito con selettore %s", sel)
+                break
+            except Exception:
+                continue
+        if not name_ok:
+            log.warning("nessun campo nome trovato (Wildix a volte lo skippa)")
+
+        # 3) Bottone finale "Collegati alla riunione" / "Join meeting"
+        join_button_patterns = (
+            "Collegati alla riunione", "Collegati",
+            "Join meeting", "Join now", "Join",
+            "Partecipa alla riunione", "Partecipa",
+        )
+        join_ok = False
+        for pat in join_button_patterns:
+            try:
+                btn = page.locator(f"button:has-text('{pat}')").first
+                if btn.is_visible(timeout=6_000):
+                    log.info("click join: %s", pat)
+                    btn.click()
+                    join_ok = True
+                    break
+            except Exception:
+                continue
+
+        if not join_ok:
+            log.error("bottone 'Collegati alla riunione' non trovato: la UI potrebbe essere cambiata")
+            return
+
+        # In call: aspettiamo max_seconds o chiusura tab (kick host)
+        log.info("in call — resto per max %ds", max_seconds)
+        try:
+            page.wait_for_event("close", timeout=max_seconds * 1000)
+            log.info("tab chiusa dal server/kick")
+        except Exception:
+            log.info("timeout durata max raggiunto: esco")
+        finally:
+            try:
+                ctx.close()
+                browser.close()
+            except Exception:
+                pass
+
+
 def join_stub(link: str, platform: str, guest_name: str, max_seconds: int) -> None:
-    """Stub per Zoom/Teams: log e sleep. v1.3.x implementera' il join
-    completo. Per ora il sidecar esiste e cattura audio zero, cosi' il hub
-    puo' validare il flusso di spawn/attesa/pickup."""
-    log.warning("piattaforma %s: join non implementato in v1.3.0, resto %ds passivo", platform, max_seconds)
+    """Stub per Zoom/Teams: log e sleep. Le implementazioni arriveranno
+    in v1.3.x. Per ora il sidecar esiste e cattura audio zero, cosi' il
+    hub puo' validare il flusso di spawn/attesa/pickup."""
+    log.warning("piattaforma %s: join non implementato ancora, resto %ds passivo", platform, max_seconds)
     time.sleep(min(max_seconds, 30))
 
 
@@ -246,7 +362,9 @@ def main() -> int:
 
         if platform == "meet":
             join_meet(args.link, args.name, args.duration)
-        elif platform in ("zoom", "teams", "xbees", "wildix", "unknown"):
+        elif platform in ("wildix", "xbees"):
+            join_wildix(args.link, args.name, args.duration)
+        elif platform in ("zoom", "teams", "unknown"):
             join_stub(args.link, platform, args.name, args.duration)
         else:
             log.error("piattaforma sconosciuta: %s", platform)
