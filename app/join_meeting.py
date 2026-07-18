@@ -344,7 +344,9 @@ def main() -> int:
     ap.add_argument("--out", default="/shared/audio.mp3", help="Path mp3 di output")
     ap.add_argument("--duration", type=int, default=3600, help="Timeout hard in secondi (default 1h)")
     ap.add_argument("--name", default="Hub Trascrizioni", help="Nome guest mostrato in call")
-    ap.add_argument("--platform", default="auto", choices=["auto", "meet", "zoom", "teams"], help="Piattaforma (auto = detect)")
+    ap.add_argument("--platform", default="auto",
+                    choices=["auto", "meet", "wildix", "xbees", "zoom", "teams"],
+                    help="Piattaforma (auto = detect dal dominio del link)")
     args = ap.parse_args()
 
     platform = args.platform
