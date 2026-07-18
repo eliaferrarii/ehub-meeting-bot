@@ -244,6 +244,18 @@ def _click_first_visible_button(page, texts, timeout_ms: int = 10_000) -> bool:
     return False
 
 
+def _shot(page, name: str) -> None:
+    """Salva uno screenshot di debug in /shared/screenshots/. Silenzioso in
+    caso di errore (Xvfb potrebbe non essere pronto in casi patologici)."""
+    try:
+        from pathlib import Path as _P
+        d = _P("/shared/screenshots")
+        d.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(d / f"{name}.png"), full_page=True)
+    except Exception:
+        pass
+
+
 def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
     """Wildix Collaboration 7 / x-bees guest join via Playwright.
 
@@ -281,6 +293,8 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
         # con `domcontentloaded` i bottoni non sono ancora stati montati.
         page.goto(link, wait_until="load", timeout=45_000)
 
+        _shot(page, "01_landing")
+
         # 1) Bottone "Continua come ospite" / "Entra come ospite" / varianti.
         # Wildix Collaboration 7 lo mostra dopo i 3 bottoni "Accedi con
         # Google/Microsoft/email". Usiamo l'helper che aspetta il primo
@@ -299,41 +313,60 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
             log.info("click guest OK")
         else:
             log.warning("bottone 'ospite' non trovato in 20s")
+        time.sleep(2)
+        _shot(page, "02_after_guest")
 
         # 2) Dopo il click 'ospite' Wildix mostra un form con un input
-        # testuale (senza placeholder specifico) e un bottone submit
-        # 'Prossimo'. Aspettiamo l'input VISIBILE (il DOM Wildix contiene
-        # anche input nascosti del flow di login classico) e lo riempiamo.
+        # testuale e un bottone submit 'Prossimo'. Compiliamo il campo
+        # con .type() (simula tasti reali che triggerano input+keydown+keyup
+        # richiesti dalla validazione React di MUI). .fill() a volte non
+        # attiva il submit su form MUI/React.
         try:
-            _first_visible_input(page, "input[type='text']", timeout_ms=15_000).fill(guest_name)
+            inp = _first_visible_input(page, "input[type='text']", timeout_ms=15_000)
+            inp.click()  # focus reale
+            inp.type(guest_name, delay=30)
             log.info("nome guest inserito: %s", guest_name)
         except Exception as exc:
             log.warning("input nome non trovato: %s", exc)
+        _shot(page, "03_after_name")
 
-        # 3) Click 'Prossimo'. Il selettore matcha 3 elementi (il primo del
-        # DOM e' un bottone nascosto del flow email/password che non uso).
-        # Serve il primo VISIBILE, non il primo del DOM.
+        # 3) Click 'Prossimo'. Il selettore matcha 3 elementi, il primo del
+        # DOM e' un bottone nascosto del flow email/password. Serve il
+        # primo VISIBILE.
         if not _click_first_visible_button(
             page, ["Prossimo", "Next"], timeout_ms=10_000,
         ):
             log.warning("bottone 'Prossimo' non trovato visibile in 10s")
 
-        # 4) Dopo 'Prossimo' Wildix presenta uno step ulteriore (prompt
-        # audio/video o un altro bottone) prima di entrare in call. Diamo
-        # qualche secondo per il rendering.
-        time.sleep(4)
+        # 4) Dopo 'Prossimo' Wildix presenta lo step "Collegati alla riunione":
+        # avatar, dettagli meeting, "Configurazione dispositivi in corso..."
+        # che diventa "I tuoi dispositivi funzionano correttamente", e il
+        # bottone BLU "Collegati alla riunione". Serve tempo per il setup
+        # dispositivi via WebRTC (senza `--use-fake-ui-for-media-stream`
+        # Chrome mostrerebbe un prompt permessi mic). Aspettiamo ~10s.
+        time.sleep(8)
+        _shot(page, "04_after_prossimo")
 
-        join_button_patterns = [
-            "Collegati alla riunione", "Collegati",
-            "Entra ora", "Entra",
-            "Partecipa alla riunione", "Partecipa",
-            "Join meeting", "Join now", "Join",
-            "Prossimo", "Next",  # a volte c'e' un altro Prossimo prima del join
-        ]
-        if _click_first_visible_button(page, join_button_patterns, timeout_ms=8_000):
-            log.info("click join finale OK")
+        # 5) Click sul bottone finale "Collegati alla riunione" (o
+        # equivalenti in EN). Ordine: prima "Collegati alla riunione"
+        # esatto, poi variazioni. Escluso "Prossimo" (che a questo punto
+        # non deve piu' matchare).
+        final_ok = _click_first_visible_button(
+            page,
+            [
+                "Collegati alla riunione", "Collegati",
+                "Join meeting", "Join the meeting", "Join now",
+                "Entra ora", "Entra nella riunione", "Entra",
+                "Partecipa alla riunione", "Partecipa",
+            ],
+            timeout_ms=15_000,
+        )
+        if final_ok:
+            log.info("click 'Collegati alla riunione' OK")
         else:
-            log.info("nessun bottone join finale visibile — assumo gia' in call")
+            log.warning("bottone finale 'Collegati alla riunione' non trovato in 15s")
+        time.sleep(3)
+        _shot(page, "05_after_final_click")
 
         # In call: aspettiamo max_seconds o chiusura tab (kick host)
         log.info("in call — resto per max %ds", max_seconds)
