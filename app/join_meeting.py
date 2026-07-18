@@ -237,73 +237,78 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
         )
         page = ctx.new_page()
         log.info("navigazione a %s", link)
-        page.goto(link, wait_until="domcontentloaded", timeout=45_000)
+        # `load` aspetta l'onload event, non solo il DOM: Wildix e' MUI/React,
+        # con `domcontentloaded` i bottoni non sono ancora stati montati.
+        page.goto(link, wait_until="load", timeout=45_000)
 
-        # 1) Bottone "Entra come ospite" / "Join as guest" / "Continua
-        # come ospite". Wildix ne ha varianti sia in italiano che inglese.
-        guest_button_patterns = (
-            "Entra come ospite", "Continua come ospite",
-            "Join as guest", "Continue as guest",
-            "Ospite", "Guest",
+        # 1) Bottone "Entra come ospite" / "Continua come ospite". Wildix
+        # Collaboration 7 lo mostra dopo i 3 bottoni "Accedi con Google/
+        # Microsoft/email". Aspettiamo con un selettore case-insensitive
+        # composito prima di iterare i pattern, cosi' evitiamo di partire
+        # mentre React sta ancora renderizzando.
+        guest_selector = (
+            "button:has-text('Continua come ospite'), "
+            "button:has-text('Entra come ospite'), "
+            "button:has-text('Continue as guest'), "
+            "button:has-text('Join as guest'), "
+            "button:has-text('Ospite'), "
+            "button:has-text('Guest')"
         )
         guest_ok = False
-        for pat in guest_button_patterns:
-            try:
-                btn = page.locator(f"button:has-text('{pat}'), a:has-text('{pat}')").first
-                if btn.is_visible(timeout=6_000):
-                    log.info("click guest: %s", pat)
-                    btn.click()
-                    guest_ok = True
-                    break
-            except Exception:
-                continue
-        if not guest_ok:
-            log.warning("bottone 'ospite' non trovato in 6s (proseguo comunque: alcune UI Wildix mostrano direttamente il campo nome)")
+        try:
+            page.wait_for_selector(guest_selector, state="visible", timeout=20_000)
+            page.locator(guest_selector).first.click()
+            log.info("click guest OK")
+            guest_ok = True
+        except Exception as exc:
+            log.warning("bottone 'ospite' non trovato in 20s: %s", exc)
 
-        # 2) Campo nome guest. Selettori generici perche' Wildix ha piu'
-        # varianti (input libero, o field con placeholder specifico).
-        name_selectors = (
-            "input[placeholder*='nome' i]",
-            "input[placeholder*='name' i]",
-            "input[aria-label*='nome' i]",
-            "input[aria-label*='name' i]",
-            "input[type='text']:not([name='email']):not([name='password'])",
+        # 2) Dopo il click 'ospite' Wildix mostra un form con un input
+        # testuale (senza placeholder specifico) e un bottone submit
+        # 'Prossimo'. Aspettiamo l'input, riempiamo col nome guest.
+        try:
+            page.wait_for_selector("input[type='text']", state="visible", timeout=15_000)
+            page.locator("input[type='text']").first.fill(guest_name)
+            log.info("nome guest inserito: %s", guest_name)
+        except Exception as exc:
+            log.warning("input nome non trovato: %s", exc)
+
+        # 3) Click 'Prossimo' (type=submit). Il form conferma il nome guest
+        # e ci porta al passo successivo (audio/video o direct join).
+        next_selector = (
+            "button[type='submit']:has-text('Prossimo'), "
+            "button[type='submit']:has-text('Next'), "
+            "button:has-text('Prossimo'), "
+            "button:has-text('Next')"
         )
-        name_ok = False
-        for sel in name_selectors:
-            try:
-                name_input = page.locator(sel).first
-                name_input.wait_for(state="visible", timeout=8_000)
-                name_input.fill(guest_name)
-                name_ok = True
-                log.info("nome guest inserito con selettore %s", sel)
-                break
-            except Exception:
-                continue
-        if not name_ok:
-            log.warning("nessun campo nome trovato (Wildix a volte lo skippa)")
+        try:
+            page.wait_for_selector(next_selector, state="visible", timeout=10_000)
+            page.locator(next_selector).first.click()
+            log.info("click 'Prossimo' OK")
+        except Exception as exc:
+            log.warning("bottone 'Prossimo' non trovato: %s", exc)
 
-        # 3) Bottone finale "Collegati alla riunione" / "Join meeting"
+        # 4) Dopo 'Prossimo' Wildix puo' presentare uno step con prompt
+        # audio/video (a volte no, direct join). Diamo qualche secondo,
+        # poi tentiamo il bottone finale se compare. Se non compare
+        # assumiamo di essere gia' in call.
+        time.sleep(4)
+
         join_button_patterns = (
             "Collegati alla riunione", "Collegati",
-            "Join meeting", "Join now", "Join",
+            "Entra ora", "Entra",
             "Partecipa alla riunione", "Partecipa",
+            "Join meeting", "Join now", "Join",
         )
-        join_ok = False
         for pat in join_button_patterns:
             try:
                 btn = page.locator(f"button:has-text('{pat}')").first
-                if btn.is_visible(timeout=6_000):
-                    log.info("click join: %s", pat)
+                if btn.is_visible(timeout=2_000):
+                    log.info("click join finale: %s", pat)
                     btn.click()
-                    join_ok = True
                     break
             except Exception:
                 continue
-
-        if not join_ok:
-            log.error("bottone 'Collegati alla riunione' non trovato: la UI potrebbe essere cambiata")
-            return
 
         # In call: aspettiamo max_seconds o chiusura tab (kick host)
         log.info("in call — resto per max %ds", max_seconds)
