@@ -1,25 +1,31 @@
 """Entrypoint del sidecar `ehub-meeting-bot`.
 
-Riceve il link di un meeting via CLI, lo apre in Chromium headless
-(dentro Xvfb per far vedere il DOM ai siti che rifiutano headless puro),
-entra come guest con un nome custom, cattura l'audio riprodotto dalla
-tab tramite PulseAudio null-sink e ffmpeg, e ritorna l'mp3 nella
-directory `/shared`.
+Riceve il link di un meeting via CLI, lo apre in Chromium dentro Xvfb
+(non-headless perche' molti siti WebRTC rifiutano il flag `--headless`),
+entra come guest, cattura l'audio riprodotto dalla tab via PulseAudio
+null-sink + ffmpeg, e scrive un mp3 nel path indicato da `--out`.
 
 Il modulo `conference_transcriber` del hub spawna questo container via
-`docker.sock`, aspetta la sua terminazione e prende `/shared/audio.mp3`
-per la trascrizione.
+`docker.sock`, aspetta la sua terminazione e prende l'mp3 per la
+trascrizione. L'output va nella dir del volume del hub, cosi' il file e'
+subito visibile senza mount separati.
 
 CLI:
     python join_meeting.py \\
         --link <url_meeting> \\
-        --out /shared/audio.mp3 \\
+        --out <path_mp3> \\
         --duration 3600 \\
         --name "Hub Trascrizioni" \\
         --platform auto
 
---platform accetta: auto | meet | zoom | teams. v1.3.0: gestisce Google
-Meet come pilot. Zoom/Teams: entry stub, gestione completa in v1.3.x.
+Piattaforme supportate (join automatico):
+- Google Meet
+- Microsoft Teams
+- Wildix Collaboration 7 / x-bees (soggetto a Cloudflare, non affidabile
+  senza sessione persistente autenticata: v1.3.x)
+
+Piattaforme in stub (accodate ma bot non entra ancora):
+- Zoom
 """
 
 from __future__ import annotations
@@ -244,14 +250,20 @@ def _click_first_visible_button(page, texts, timeout_ms: int = 10_000) -> bool:
     return False
 
 
+# Directory dove salvare gli screenshot di debug. Impostata in main()
+# a partire dal path dell'output mp3, cosi' segue il volume mount del
+# chiamante invece di essere hardcoded a /shared.
+_SCREENSHOTS_DIR: Optional[Path] = None
+
+
 def _shot(page, name: str) -> None:
-    """Salva uno screenshot di debug in /shared/screenshots/. Silenzioso in
-    caso di errore (Xvfb potrebbe non essere pronto in casi patologici)."""
+    """Salva uno screenshot di debug accanto al file audio di output.
+    Silenzioso in caso di errore (Xvfb potrebbe non essere pronto)."""
+    if _SCREENSHOTS_DIR is None:
+        return
     try:
-        from pathlib import Path as _P
-        d = _P("/shared/screenshots")
-        d.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(d / f"{name}.png"), full_page=True)
+        _SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(_SCREENSHOTS_DIR / f"{name}.png"), full_page=True)
     except Exception:
         pass
 
@@ -383,6 +395,106 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
                 pass
 
 
+def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
+    """Microsoft Teams guest join via Playwright.
+
+    Flusso (v1.3, browser web):
+      1. Landing "Come vuoi partecipare?" con 3 opzioni: "Scarica app" /
+         "Apri app Teams" / "Continua su questo browser". Clicchiamo la
+         terza.
+      2. Pre-join: input nome guest + toggle mic/cam + bottone
+         "Unisciti ora" / "Join now".
+      3. In call. Se la riunione ha waiting room / lobby, restiamo in
+         attesa dell'admit.
+
+    Teams non ha Cloudflare Turnstile sui guest link, e i selettori sono
+    piu' stabili di Wildix. Ma la UI ha 3-4 varianti che coesistono per
+    A/B testing: matchiamo con testi in IT e EN in cascata."""
+    from playwright.sync_api import sync_playwright  # noqa: WPS433
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,
+            args=[
+                "--use-fake-ui-for-media-stream",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        ctx = browser.new_context(
+            locale="it-IT",
+            timezone_id="Europe/Rome",
+            permissions=["microphone", "camera"],
+        )
+        page = ctx.new_page()
+        log.info("navigazione a %s", link)
+        page.goto(link, wait_until="load", timeout=45_000)
+        _shot(page, "teams_01_landing")
+
+        # 1) Landing puo' mostrare vari CTA. Prova nell'ordine:
+        # "Continua su questo browser" e' quello che vogliamo.
+        # Se compare direttamente la pre-join, questo step non fa nulla
+        # e ce ne accorgiamo al step 2.
+        _click_first_visible_button(
+            page,
+            [
+                "Continua su questo browser",
+                "Continue on this browser",
+                "Guarda su Web",
+                "Watch on web",
+                "Partecipa sul Web",
+                "Join on the web instead",
+            ],
+            timeout_ms=15_000,
+        )
+        time.sleep(3)
+        _shot(page, "teams_02_after_browser")
+
+        # 2) Campo nome guest. Teams lo mostra come `<input type="text">`
+        # (a volte con placeholder "Type your name" o "Digita il tuo nome").
+        try:
+            inp = _first_visible_input(page, "input[type='text']", timeout_ms=15_000)
+            inp.click()
+            inp.type(guest_name, delay=30)
+            log.info("nome inserito: %s", guest_name)
+        except Exception as exc:
+            log.warning("input nome non trovato: %s", exc)
+        _shot(page, "teams_03_after_name")
+
+        # 3) Bottone finale "Unisciti ora" / "Join now"
+        if _click_first_visible_button(
+            page,
+            [
+                "Unisciti ora", "Unisciti alla riunione", "Unisciti",
+                "Partecipa ora", "Partecipa alla riunione", "Partecipa",
+                "Entra ora", "Entra",
+                "Join now", "Join meeting", "Join the meeting", "Join",
+            ],
+            timeout_ms=15_000,
+        ):
+            log.info("click 'Unisciti ora' OK")
+        else:
+            log.warning("bottone 'Unisciti' non trovato in 15s")
+        time.sleep(3)
+        _shot(page, "teams_04_after_join")
+
+        # In call: se lobby, resta in attesa dell'admit fino al timeout.
+        log.info("in call — resto per max %ds", max_seconds)
+        try:
+            page.wait_for_event("close", timeout=max_seconds * 1000)
+            log.info("tab chiusa dal server/kick")
+        except Exception:
+            log.info("timeout durata max: esco")
+        finally:
+            try:
+                ctx.close()
+                browser.close()
+            except Exception:
+                pass
+
+
 def join_stub(link: str, platform: str, guest_name: str, max_seconds: int) -> None:
     """Stub per Zoom/Teams: log e sleep. Le implementazioni arriveranno
     in v1.3.x. Per ora il sidecar esiste e cattura audio zero, cosi' il
@@ -412,6 +524,9 @@ def main() -> int:
                     help="Piattaforma (auto = detect dal dominio del link)")
     args = ap.parse_args()
 
+    global _SCREENSHOTS_DIR
+    _SCREENSHOTS_DIR = Path(args.out).parent / "screenshots"
+
     platform = args.platform
     if platform == "auto":
         platform = detect_platform(args.link)
@@ -427,9 +542,11 @@ def main() -> int:
 
         if platform == "meet":
             join_meet(args.link, args.name, args.duration)
+        elif platform == "teams":
+            join_teams(args.link, args.name, args.duration)
         elif platform in ("wildix", "xbees"):
             join_wildix(args.link, args.name, args.duration)
-        elif platform in ("zoom", "teams", "unknown"):
+        elif platform in ("zoom", "unknown"):
             join_stub(args.link, platform, args.name, args.duration)
         else:
             log.error("piattaforma sconosciuta: %s", platform)
