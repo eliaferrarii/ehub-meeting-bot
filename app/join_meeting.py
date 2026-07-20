@@ -484,10 +484,24 @@ def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
 
         # 2) Campo nome guest. Teams lo mostra come `<input type="text">`
         # (a volte con placeholder "Type your name" o "Digita il tuo nome").
+        # NB: teams.live.com sul pre-join tiene un overlay SVG di splash
+        # (`<div data-portal-node="true">` con il logo Teams #464775) che
+        # copre il campo per qualche secondo e intercetta i pointer events.
+        # `click() + type()` fallisce con "subtree intercepts pointer
+        # events" e 60 retry inutili. `fill()` scrive direttamente sul
+        # value senza click, aggira lo splash. Se serve triggerare l'evento
+        # keydown (React di Teams usa keyup per abilitare "Unisciti"),
+        # tentiamo un focus + type finale che non richiede pointer events.
         try:
             inp = _first_visible_input(page, "input[type='text']", timeout_ms=15_000)
-            inp.click()
-            inp.type(guest_name, delay=30)
+            inp.fill(guest_name)
+            try:
+                inp.focus()
+                # `press` singola tastiera per far scattare gli handler
+                # onChange/onKeyUp senza riscrivere tutto il nome.
+                inp.press("End")
+            except Exception:
+                pass
             log.info("nome inserito: %s", guest_name)
         except Exception as exc:
             log.warning("input nome non trovato: %s", exc)
