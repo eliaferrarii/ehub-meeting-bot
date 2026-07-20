@@ -242,7 +242,29 @@ def start_pulseaudio() -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(2)
+    # `time.sleep(2)` fisso non basta: pulseaudio a volte impiega piu' di
+    # 2s per caricare il module-null-sink e ffmpeg parte trovando
+    # `hub_capture.monitor: No such process` (== ENOENT su pulse sources).
+    # Poll pactl finche' il sink esiste, max 15s.
+    monitor = f"{SINK_NAME}.monitor"
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "short", "sources"],
+                env=env, capture_output=True, timeout=2,
+            )
+            if r.returncode == 0 and monitor in r.stdout.decode("utf-8", "replace"):
+                log.info("null-sink %s pronto in %.1fs", monitor, 15 - (deadline - time.time()))
+                return proc
+        except Exception:
+            pass
+        time.sleep(0.5)
+    log.warning(
+        "null-sink %s non ancora visibile dopo 15s, provo comunque "
+        "(ffmpeg potrebbe morire subito)",
+        monitor,
+    )
     return proc
 
 
