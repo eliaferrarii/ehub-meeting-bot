@@ -507,6 +507,24 @@ def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
             log.warning("input nome non trovato: %s", exc)
         _shot(page, "teams_03_after_name")
 
+        # 2b) Teams Live consumer, nonostante `--use-fake-ui-for-media-stream`,
+        # apre una modale "Non vuoi consentire l'audio o il video?" con un
+        # bottone "Continua senza audio o video" che COPRE il bottone
+        # "Partecipa ora" in basso a destra. Se non la chiudiamo, il click
+        # finale fallisce con "subtree intercepts pointer events" e il bot
+        # resta a registrare aria per tutta la durata del meeting.
+        # Il click va bene per noi: siamo un bot di ascolto, non abbiamo
+        # niente da trasmettere.
+        _click_first_visible_button(
+            page,
+            [
+                "Continua senza audio o video",
+                "Continue without audio or video",
+            ],
+            timeout_ms=5_000,
+        )
+        time.sleep(1)
+
         # 3) Bottone finale "Unisciti ora" / "Join now"
         if _click_first_visible_button(
             page,
