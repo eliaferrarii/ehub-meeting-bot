@@ -249,10 +249,19 @@ def start_pulseaudio() -> subprocess.Popen:
 def start_ffmpeg(out_path: Path, max_seconds: int) -> subprocess.Popen:
     """Registra dal monitor del null-sink in mp3. Durata limite = max_seconds
     (hard timeout): il modulo del hub calcola la durata attesa dall'iCal +
-    un margine e la passa qui."""
+    un margine e la passa qui.
+
+    stderr redirect a file: senza questo non vediamo perche' ffmpeg
+    fallisce (sink inesistente, codec mancante, ecc.) e ci ritroviamo
+    con 'nessun audio prodotto' senza nessuna indicazione. Il file viene
+    lasciato accanto all'output mp3, cosi' segue lo stesso volume mount
+    e il chiamante puo' recuperarlo insieme all'audio."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    log.info("avvio ffmpeg -> %s (max %ds)", out_path, max_seconds)
-    return subprocess.Popen(
+    stderr_path = out_path.with_suffix(out_path.suffix + ".ffmpeg.log")
+    log.info("avvio ffmpeg -> %s (max %ds, stderr=%s)",
+             out_path, max_seconds, stderr_path)
+    stderr_fd = open(stderr_path, "wb")
+    proc = subprocess.Popen(
         [
             "ffmpeg", "-y",
             "-f", "pulse", "-i", f"{SINK_NAME}.monitor",
@@ -262,8 +271,25 @@ def start_ffmpeg(out_path: Path, max_seconds: int) -> subprocess.Popen:
             str(out_path),
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_fd,
     )
+    # Attach il fd al processo per keep-alive (chiuderlo prematuramente
+    # farebbe perdere gli ultimi log).
+    proc._ehub_stderr_fd = stderr_fd  # type: ignore[attr-defined]
+    # Sanity check: dopo 2s ffmpeg deve essere ancora vivo. Se e' morto
+    # subito e' quasi sempre "no such device" sul sink pulse.
+    time.sleep(2)
+    if proc.poll() is not None:
+        log.error(
+            "ffmpeg MORTO dopo 2s exit=%s. Controlla %s",
+            proc.returncode, stderr_path,
+        )
+        try:
+            tail = stderr_path.read_bytes()[-1500:].decode("utf-8", "replace")
+            log.error("ffmpeg stderr tail:\n%s", tail)
+        except Exception:
+            pass
+    return proc
 
 
 def join_meet(link: str, guest_name: str, max_seconds: int) -> None:
@@ -757,6 +783,16 @@ def main() -> int:
             log.info("audio prodotto: %s (%d byte)", out, out.stat().st_size)
         else:
             log.warning("nessun audio prodotto")
+            # Se ffmpeg ha lasciato un log stderr, ne prendo il tail cosi'
+            # il modulo del hub lo vede nelle notes del meeting invece di
+            # dover fare docker logs (che non c'e' piu' col remove=True).
+            stderr_path = out.with_suffix(out.suffix + ".ffmpeg.log")
+            if stderr_path.exists():
+                try:
+                    tail = stderr_path.read_bytes()[-1500:].decode("utf-8", "replace")
+                    log.warning("ffmpeg stderr tail:\n%s", tail)
+                except Exception:
+                    pass
             exit_code = exit_code or 3
 
     return exit_code
