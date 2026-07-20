@@ -33,9 +33,12 @@ lo stato del meeting come `failed`.
 
 ## Piattaforme supportate
 
-- **Google Meet** — guest join implementato in v1.3.0 (pilot).
-- **Zoom / Teams / x-bees / Wildix** — stub, join da implementare in
-  v1.3.x.
+- **Google Meet** — guest join implementato.
+- **Microsoft Teams** — guest join implementato (browser web, no app
+  desktop). Se la riunione ha lobby, il bot resta in attesa dell'admit
+  fino al timeout.
+- **Wildix Collaboration 7 / x-bees** — guest join implementato.
+- **Zoom** — stub, join da implementare.
 
 ## Build
 

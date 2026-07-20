@@ -215,8 +215,17 @@ def _first_visible_input(page, selector: str, timeout_ms: int = 10_000):
     il DOM contiene input nascosti (form login) accanto a quelli attivi."""
     end = time.time() + timeout_ms / 1000.0
     while time.time() < end:
-        loc = page.locator(selector)
-        for i in range(loc.count()):
+        # `loc.count()` puo' esplodere con "Execution context was destroyed"
+        # se la pagina sta facendo una redirect JS proprio mentre lo
+        # chiamiamo (Teams lo fa dopo il landing). Trattiamolo come "riprova
+        # al prossimo tick" invece di far cadere l'intero join.
+        try:
+            loc = page.locator(selector)
+            count = loc.count()
+        except Exception:
+            time.sleep(0.3)
+            continue
+        for i in range(count):
             el = loc.nth(i)
             try:
                 if el.is_visible():
@@ -236,9 +245,17 @@ def _click_first_visible_button(page, texts, timeout_ms: int = 10_000) -> bool:
     `.first`, prendiamo quelli nascosti e falliamo su actionability."""
     end = time.time() + timeout_ms / 1000.0
     while time.time() < end:
+        context_lost = False
         for txt in texts:
-            loc = page.locator(f"button:has-text('{txt}')")
-            for i in range(loc.count()):
+            # Vedi commento in _first_visible_input: la .count() e'
+            # sensibile alle navigation in corso.
+            try:
+                loc = page.locator(f"button:has-text('{txt}')")
+                count = loc.count()
+            except Exception:
+                context_lost = True
+                break
+            for i in range(count):
                 el = loc.nth(i)
                 try:
                     if el.is_visible():
@@ -246,6 +263,9 @@ def _click_first_visible_button(page, texts, timeout_ms: int = 10_000) -> bool:
                         return True
                 except Exception:
                     continue
+        if context_lost:
+            time.sleep(0.5)
+            continue
         time.sleep(0.3)
     return False
 
@@ -431,6 +451,16 @@ def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
         page = ctx.new_page()
         log.info("navigazione a %s", link)
         page.goto(link, wait_until="load", timeout=45_000)
+        # Il landing di Teams fa 1-2 redirect JS (a `teams.microsoft.com/dl/launcher`
+        # e poi al pre-join). Se iniziamo a cliccare prima che la catena
+        # finisca, `locator.count()` esplode con "Execution context was
+        # destroyed". `networkidle` non e' garantito su Teams, quindi
+        # best-effort con timeout corto: se scade partiamo comunque, gli
+        # helper `_click_first_visible_button` ora sanno riprovare.
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            log.info("networkidle non raggiunto in 10s, proseguo comunque")
         _shot(page, "teams_01_landing")
 
         # 1) Landing puo' mostrare vari CTA. Prova nell'ordine:
