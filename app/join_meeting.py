@@ -83,7 +83,7 @@ ALONE_TEXTS = (
     "You're the only one here",
     "Sei l'unico partecipante",
 )
-ALONE_TIMEOUT_SEC = 120
+ALONE_TIMEOUT_SEC = 300
 
 
 def _install_signal_handlers() -> None:
