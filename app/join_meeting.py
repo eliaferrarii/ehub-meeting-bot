@@ -38,6 +38,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -52,6 +53,104 @@ log = logging.getLogger("meeting-bot")
 
 DISPLAY = ":99"
 SINK_NAME = "hub_capture"
+
+# Flag settato dal signal handler SIGTERM/SIGINT (docker stop). Il loop
+# di attesa in call lo controlla ad ogni tick e esce pulito, permettendo
+# a ffmpeg di flushare l'mp3 nel blocco `finally` di main().
+_SHUTDOWN = threading.Event()
+
+# Testi che indicano "sei stato rimosso / riunione terminata" e
+# comportano uscita immediata dal bot (chiudere la tab non basta:
+# Teams mostra una schermata statica con bottoni Partecipa/Chiudi).
+REMOVED_TEXTS = (
+    "Sei stato rimosso dalla riunione",
+    "Sei stato rimosso",
+    "You have been removed",
+    "You were removed",
+    "Riunione terminata",
+    "La riunione è terminata",
+    "Meeting has ended",
+    "Meeting ended",
+    "Call ended",
+)
+
+# Testi che indicano "sei l'unico partecipante". Se persistono per piu'
+# di ALONE_TIMEOUT_SEC, esci: significa che l'organizzatore e' uscito
+# ma Teams non ha chiuso la stanza (comportamento tipico di teams.live.com).
+ALONE_TEXTS = (
+    "In attesa di altri partecipanti",
+    "Waiting for others to join",
+    "You're the only one here",
+    "Sei l'unico partecipante",
+)
+ALONE_TIMEOUT_SEC = 120
+
+
+def _install_signal_handlers() -> None:
+    """SIGTERM (docker stop) e SIGINT -> shutdown pulito.
+
+    Senza questo, docker stop uccide python al PID 1 senza eseguire il
+    blocco `finally` di main() che chiude ffmpeg: risultato = mp3 a 0
+    byte (o inesistente) e trascrizione fallita. Con questo, il loop di
+    attesa vede _SHUTDOWN e ritorna, arriviamo al finally, ffmpeg riceve
+    SIGTERM, chiude header/tail dell'mp3 e il file e' valido."""
+    def _handler(sig, _frame):
+        log.info("segnale %s ricevuto, shutdown pulito", sig)
+        _SHUTDOWN.set()
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
+def _text_present(page, text: str) -> bool:
+    """True se `text` e' presente nel DOM. Usa .count() invece di
+    .is_visible() per evitare i timeout impliciti di Playwright: qui
+    vogliamo un check istantaneo, non un wait."""
+    try:
+        return page.locator(f"text={text}").count() > 0
+    except Exception:
+        return False
+
+
+def _wait_in_call(page, max_seconds: int) -> str:
+    """Loop di attesa in call. Sostituisce il vecchio
+    `page.wait_for_event('close', ...)` che blocca il thread e non
+    reagisce ne' a SIGTERM ne' a schermate 'rimosso' / 'solo in call'.
+
+    Ritorna il motivo di uscita per log:
+      - 'shutdown'   : SIGTERM/SIGINT ricevuto (docker stop)
+      - 'tab_closed' : tab chiusa dal server (host kick / meeting ended)
+      - 'removed'    : rilevato testo 'sei stato rimosso'
+      - 'alone'      : rilevato 'solo in call' per >ALONE_TIMEOUT_SEC
+      - 'timeout'    : raggiunto max_seconds (durata iCal + buffer)
+    """
+    deadline = time.time() + max_seconds
+    alone_since: Optional[float] = None
+    while time.time() < deadline:
+        if _SHUTDOWN.is_set():
+            return "shutdown"
+        try:
+            if page.is_closed():
+                return "tab_closed"
+        except Exception:
+            return "tab_closed"
+        for txt in REMOVED_TEXTS:
+            if _text_present(page, txt):
+                log.info("rilevato in call: '%s'", txt)
+                return "removed"
+        is_alone = any(_text_present(page, t) for t in ALONE_TEXTS)
+        if is_alone:
+            if alone_since is None:
+                alone_since = time.time()
+                log.info(
+                    "rilevato 'solo in call', esco se dura >%ds",
+                    ALONE_TIMEOUT_SEC,
+                )
+            elif time.time() - alone_since > ALONE_TIMEOUT_SEC:
+                return "alone"
+        else:
+            alone_since = None
+        time.sleep(3)
+    return "timeout"
 
 
 def detect_platform(link: str) -> str:
@@ -194,20 +293,17 @@ def join_meet(link: str, guest_name: str, max_seconds: int) -> None:
             log.error("bottone Join non trovato: uscita anticipata")
             return
 
-        # In call: attendiamo max_seconds oppure che la tab si chiuda
-        # (host kick). Restiamo passivi.
+        # In call: usa _wait_in_call per gestire SIGTERM, 'sei stato
+        # rimosso', 'solo in call' e timeout con la stessa logica delle
+        # altre piattaforme.
         log.info("in call — resto per max %ds", max_seconds)
+        reason = _wait_in_call(page, max_seconds)
+        log.info("uscita in call: motivo=%s", reason)
         try:
-            page.wait_for_event("close", timeout=max_seconds * 1000)
-            log.info("tab chiusa dal server/kick")
+            ctx.close()
+            browser.close()
         except Exception:
-            log.info("timeout durata max raggiunto: esco")
-        finally:
-            try:
-                ctx.close()
-                browser.close()
-            except Exception:
-                pass
+            pass
 
 
 def _first_visible_input(page, selector: str, timeout_ms: int = 10_000):
@@ -400,19 +496,15 @@ def join_wildix(link: str, guest_name: str, max_seconds: int) -> None:
         time.sleep(3)
         _shot(page, "05_after_final_click")
 
-        # In call: aspettiamo max_seconds o chiusura tab (kick host)
+        # In call: usa _wait_in_call condiviso.
         log.info("in call — resto per max %ds", max_seconds)
+        reason = _wait_in_call(page, max_seconds)
+        log.info("uscita in call: motivo=%s", reason)
         try:
-            page.wait_for_event("close", timeout=max_seconds * 1000)
-            log.info("tab chiusa dal server/kick")
+            ctx.close()
+            browser.close()
         except Exception:
-            log.info("timeout durata max raggiunto: esco")
-        finally:
-            try:
-                ctx.close()
-                browser.close()
-            except Exception:
-                pass
+            pass
 
 
 def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
@@ -543,18 +635,16 @@ def join_teams(link: str, guest_name: str, max_seconds: int) -> None:
         _shot(page, "teams_04_after_join")
 
         # In call: se lobby, resta in attesa dell'admit fino al timeout.
+        # _wait_in_call gestisce anche 'Sei stato rimosso' e 'In attesa
+        # di altri partecipanti' (organizzatore uscito ma stanza aperta).
         log.info("in call — resto per max %ds", max_seconds)
+        reason = _wait_in_call(page, max_seconds)
+        log.info("uscita in call: motivo=%s", reason)
         try:
-            page.wait_for_event("close", timeout=max_seconds * 1000)
-            log.info("tab chiusa dal server/kick")
+            ctx.close()
+            browser.close()
         except Exception:
-            log.info("timeout durata max: esco")
-        finally:
-            try:
-                ctx.close()
-                browser.close()
-            except Exception:
-                pass
+            pass
 
 
 def join_stub(link: str, platform: str, guest_name: str, max_seconds: int) -> None:
@@ -588,6 +678,10 @@ def main() -> int:
 
     global _SCREENSHOTS_DIR
     _SCREENSHOTS_DIR = Path(args.out).parent / "screenshots"
+
+    # SIGTERM/SIGINT -> shutdown pulito (docker stop). Deve stare prima
+    # di start_xvfb altrimenti un docker stop precoce salta il cleanup.
+    _install_signal_handlers()
 
     platform = args.platform
     if platform == "auto":
