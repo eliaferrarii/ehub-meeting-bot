@@ -74,16 +74,33 @@ REMOVED_TEXTS = (
     "Call ended",
 )
 
-# Testi che indicano "sei l'unico partecipante". Se persistono per piu'
-# di ALONE_TIMEOUT_SEC, esci: significa che l'organizzatore e' uscito
-# ma Teams non ha chiuso la stanza (comportamento tipico di teams.live.com).
+# Testi che indicano "sei l'unico partecipante" DENTRO la call. Se
+# persistono per piu' di ALONE_TIMEOUT_SEC esci: l'organizzatore e'
+# uscito ma Teams non ha chiuso la stanza (tipico di teams.live.com).
 ALONE_TEXTS = (
     "In attesa di altri partecipanti",
     "Waiting for others to join",
     "You're the only one here",
     "Sei l'unico partecipante",
 )
-ALONE_TIMEOUT_SEC = 300
+ALONE_TIMEOUT_SEC = 60
+
+# Testi che indicano "sei nella sala d'attesa / lobby", cioe' hai
+# cliccato Partecipa ma l'host non ti ha ancora ammesso. Se restiamo
+# piu' di LOBBY_TIMEOUT_SEC senza essere ammessi, esci: nessuno ci
+# lascia entrare, inutile occupare risorse.
+LOBBY_TEXTS = (
+    "Attendi che ti facciano entrare",
+    "Ti faranno entrare a breve",
+    "Someone will let you in shortly",
+    "Waiting for the host to let you in",
+    "Waiting for the meeting to start",
+    "In attesa di essere ammesso",
+    "In attesa di essere ammessi",
+    "Ti stanno aspettando",
+    "When the meeting starts, we'll let people know you're waiting",
+)
+LOBBY_TIMEOUT_SEC = 300
 
 
 def _install_signal_handlers() -> None:
@@ -114,16 +131,19 @@ def _text_present(page, text: str) -> bool:
 def _wait_in_call(page, max_seconds: int) -> str:
     """Loop di attesa in call. Sostituisce il vecchio
     `page.wait_for_event('close', ...)` che blocca il thread e non
-    reagisce ne' a SIGTERM ne' a schermate 'rimosso' / 'solo in call'.
+    reagisce ne' a SIGTERM ne' a schermate 'rimosso' / 'lobby' /
+    'solo in call'.
 
     Ritorna il motivo di uscita per log:
-      - 'shutdown'   : SIGTERM/SIGINT ricevuto (docker stop)
-      - 'tab_closed' : tab chiusa dal server (host kick / meeting ended)
-      - 'removed'    : rilevato testo 'sei stato rimosso'
-      - 'alone'      : rilevato 'solo in call' per >ALONE_TIMEOUT_SEC
-      - 'timeout'    : raggiunto max_seconds (durata iCal + buffer)
+      - 'shutdown'      : SIGTERM/SIGINT ricevuto (docker stop)
+      - 'tab_closed'    : tab chiusa dal server (host kick / meeting ended)
+      - 'removed'       : rilevato testo 'sei stato rimosso'
+      - 'lobby_timeout' : bloccato in sala d'attesa per >LOBBY_TIMEOUT_SEC
+      - 'alone'         : solo in call per >ALONE_TIMEOUT_SEC
+      - 'timeout'       : raggiunto max_seconds (durata iCal + buffer)
     """
     deadline = time.time() + max_seconds
+    lobby_since: Optional[float] = None
     alone_since: Optional[float] = None
     while time.time() < deadline:
         if _SHUTDOWN.is_set():
@@ -135,20 +155,34 @@ def _wait_in_call(page, max_seconds: int) -> str:
             return "tab_closed"
         for txt in REMOVED_TEXTS:
             if _text_present(page, txt):
-                log.info("rilevato in call: '%s'", txt)
+                log.info("rilevato: '%s'", txt)
                 return "removed"
-        is_alone = any(_text_present(page, t) for t in ALONE_TEXTS)
-        if is_alone:
-            if alone_since is None:
-                alone_since = time.time()
+        in_lobby = any(_text_present(page, t) for t in LOBBY_TEXTS)
+        if in_lobby:
+            if lobby_since is None:
+                lobby_since = time.time()
                 log.info(
-                    "rilevato 'solo in call', esco se dura >%ds",
-                    ALONE_TIMEOUT_SEC,
+                    "rilevato lobby/sala d'attesa, esco se dura >%ds",
+                    LOBBY_TIMEOUT_SEC,
                 )
-            elif time.time() - alone_since > ALONE_TIMEOUT_SEC:
-                return "alone"
-        else:
+            elif time.time() - lobby_since > LOBBY_TIMEOUT_SEC:
+                return "lobby_timeout"
+            # In lobby non sei in call: azzera l'altro counter.
             alone_since = None
+        else:
+            lobby_since = None
+            is_alone = any(_text_present(page, t) for t in ALONE_TEXTS)
+            if is_alone:
+                if alone_since is None:
+                    alone_since = time.time()
+                    log.info(
+                        "rilevato 'solo in call', esco se dura >%ds",
+                        ALONE_TIMEOUT_SEC,
+                    )
+                elif time.time() - alone_since > ALONE_TIMEOUT_SEC:
+                    return "alone"
+            else:
+                alone_since = None
         time.sleep(3)
     return "timeout"
 
