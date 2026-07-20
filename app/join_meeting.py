@@ -769,6 +769,16 @@ def main() -> int:
     # di start_xvfb altrimenti un docker stop precoce salta il cleanup.
     _install_signal_handlers()
 
+    # PulseAudio user-mode crea il socket in $XDG_RUNTIME_DIR/pulse/;
+    # tutti i client (pactl, ffmpeg, Chromium) devono vedere lo stesso
+    # path per usare la stessa istanza. Se lo settiamo solo nell'env di
+    # start_pulseaudio, ffmpeg (con env di default) cerca il socket in
+    # /run/user/UID e trova nulla -> "hub_capture.monitor: No such
+    # process" nonostante pulse abbia caricato il sink correttamente.
+    # Settarlo qui a livello di processo assicura che tutti i child lo
+    # ereditino.
+    os.environ["XDG_RUNTIME_DIR"] = "/tmp"
+
     platform = args.platform
     if platform == "auto":
         platform = detect_platform(args.link)
