@@ -90,15 +90,19 @@ ALONE_TIMEOUT_SEC = 60
 # piu' di LOBBY_TIMEOUT_SEC senza essere ammessi, esci: nessuno ci
 # lascia entrare, inutile occupare risorse.
 LOBBY_TEXTS = (
+    # Teams Live consumer (confermato via screenshot 2026-07-20)
+    "A breve qualcuno ti farà partecipare",
+    "Someone will let you in shortly",
+    # Teams enterprise
     "Attendi che ti facciano entrare",
     "Ti faranno entrare a breve",
-    "Someone will let you in shortly",
     "Waiting for the host to let you in",
     "Waiting for the meeting to start",
+    "When the meeting starts, we'll let people know you're waiting",
+    # Meet
+    "Ti stanno aspettando",
     "In attesa di essere ammesso",
     "In attesa di essere ammessi",
-    "Ti stanno aspettando",
-    "When the meeting starts, we'll let people know you're waiting",
 )
 LOBBY_TIMEOUT_SEC = 300
 
