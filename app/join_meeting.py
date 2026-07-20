@@ -174,6 +174,12 @@ def _wait_in_call(page, max_seconds: int) -> str:
             # In lobby non sei in call: azzera l'altro counter.
             alone_since = None
         else:
+            # Transizione: eravamo in lobby, ora non piu' -> siamo stati
+            # ammessi. Log esplicito: il scheduler del hub legge questa riga
+            # per far passare lo stato da 'waiting_lobby' a 'in_call'.
+            if lobby_since is not None:
+                log.info("ammesso in call (uscito dalla lobby dopo %.1fs)",
+                         time.time() - lobby_since)
             lobby_since = None
             is_alone = any(_text_present(page, t) for t in ALONE_TEXTS)
             if is_alone:
